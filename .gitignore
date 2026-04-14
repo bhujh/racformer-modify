@@ -144,3 +144,4 @@ submission/
 submission_mini/
 visual_outputs/
 *.whl
+.git/
