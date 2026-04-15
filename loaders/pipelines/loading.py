@@ -11,6 +11,136 @@ from mmdet.datasets.pipelines import LoadAnnotations, LoadImageFromFile
 
 import os, cv2, matplotlib.pyplot as plt
 import numpy as np 
+import torch
+from mmdet3d.core.points import get_points_type
+
+# 由于pypcd在Python 3.8中有兼容性问题，直接使用纯Python解析
+PYPCD_AVAILABLE = False
+print("Info: Using pure Python parsing for .pcd files.")
+
+
+def load_pcd_points(pcd_path):
+    """
+    加载.pcd文件，支持pypcd和纯Python解析两种方式
+    
+    优先级：
+    1. pypcd（如果已安装）
+    2. 纯Python解析（备选）
+    
+    Args:
+        pcd_path: .pcd文件路径
+    
+    Returns:
+        points: (N, 7) numpy array
+                [x, y, z, vx, vy, RCS, timestamp_offset]
+    """
+    if PYPCD_AVAILABLE:
+        return _load_pcd_with_pypcd(pcd_path)
+    else:
+        return _load_pcd_with_python(pcd_path)
+
+
+def _load_pcd_with_pypcd(pcd_path):
+    """
+    使用pypcd加载.pcd文件（推荐方式）
+    
+    支持两种格式：
+    1. 完整格式：x, y, z, vx, vy, RCS (6字段)
+    2. 当前格式：x, y, z, intensity (4字段)
+    """
+    pc = pypcd_module.PointCloud.from_path(pcd_path)
+    N = pc.pc_data.shape[0]
+    points = np.zeros((N, 7), dtype=np.float32)
+    
+    # 基础字段（必须）
+    points[:, 0] = pc.pc_data['x']
+    points[:, 1] = pc.pc_data['y']
+    points[:, 2] = pc.pc_data['z']
+    
+    # 可选字段
+    fields = pc.fields
+    if 'vx' in fields:
+        points[:, 3] = pc.pc_data['vx']
+    if 'vy' in fields:
+        points[:, 4] = pc.pc_data['vy']
+    if 'RCS' in fields:
+        points[:, 5] = pc.pc_data['RCS']
+    elif 'intensity' in fields:
+        points[:, 5] = pc.pc_data['intensity']  # 使用intensity作为RCS
+    
+    # timestamp offset默认为0
+    points[:, 6] = 0
+    
+    return points
+
+
+def _load_pcd_with_python(pcd_path):
+    """
+    纯Python解析.pcd文件（备选方式）
+    适用于ASCII格式的.pcd文件
+    """
+    with open(pcd_path, 'r') as f:
+        lines = f.readlines()
+    
+    # 解析头部
+    fields = []
+    data_start = 0
+    for i, line in enumerate(lines):
+        if line.startswith('FIELDS'):
+            fields = line.strip().split()[1:]
+        elif line.startswith('DATA'):
+            data_start = i + 1
+            break
+    
+    # 解析数据
+    data_list = []
+    for line in lines[data_start:]:
+        parts = line.strip().split()
+        if len(parts) >= len(fields):
+            data_list.append([float(p) for p in parts])
+    
+    if len(data_list) == 0:
+        raise ValueError(f"No data found in {pcd_path}")
+    
+    data = np.array(data_list, dtype=np.float32)
+    N = data.shape[0]
+    points = np.zeros((N, 7), dtype=np.float32)
+    
+    # 映射字段
+    field_map = {
+        'x': 0, 'y': 1, 'z': 2,
+        'vx': 3, 'vy': 4,
+        'RCS': 5, 'intensity': 5
+    }
+    
+    for i, field in enumerate(fields):
+        if field in field_map:
+            points[:, field_map[field]] = data[:, i]
+    
+    return points
+
+
+def load_npy_points(npy_path):
+    """
+    加载.npy文件（为未来准备）
+    
+    期望格式：(N, 6) 或 (N, 7) numpy array
+              [x, y, z, vx, vy, RCS] 或 [x, y, z, vx, vy, RCS, timestamp]
+    """
+    points = np.load(npy_path)
+    
+    if points.shape[1] == 6:
+        # 添加timestamp列
+        timestamp = np.zeros((points.shape[0], 1), dtype=np.float32)
+        points = np.concatenate([points, timestamp], axis=1)
+    elif points.shape[1] == 7:
+        # 已经包含timestamp
+        pass
+    else:
+        raise ValueError(f"Expected 6 or 7 columns, got {points.shape[1]} columns")
+    
+    return points.astype(np.float32)
+
 
 def compose_lidar2img(ego2global_translation_curr,
                       ego2global_rotation_curr,
@@ -582,8 +712,10 @@ class RadarPointToMultiViewDepth(object):
 
             depth_map, rcs_map = self.points2depthmap(points_img, img.shape[0],
                                             img.shape[1])
-            depth_map_list.append(depth_map)
-            rcs_map_list.append(rcs_map)
+            # 将当前帧复制8次（模拟8个时间帧）
+            for _ in range(8):
+                depth_map_list.append(depth_map)
+                rcs_map_list.append(rcs_map)
         depth_map = torch.stack(depth_map_list)
         rcs_map = torch.stack(rcs_map_list)
         results['radar_depth'] = depth_map
@@ -766,6 +898,30 @@ class Loadnuradarpoints(object):
         self.file_client_args = file_client_args.copy()
         self.file_client = None
 
+    def _load_own_radar(self, pts_filename):
+        """
+        加载自定义数据集的radar点云（支持.pcd和.npy格式）
+        
+        Args:
+            pts_filename: radar文件路径
+        
+        Returns:
+            points: torch.Tensor, shape (N, 7)
+        """
+        # 检查文件扩展名
+        if pts_filename.endswith('.pcd'):
+            points = load_pcd_points(pts_filename)
+        elif pts_filename.endswith('.npy'):
+            points = load_npy_points(pts_filename)
+        else:
+            # 默认按.bin格式处理（nuScenes格式）
+            raise ValueError(f"Unsupported file format: {pts_filename}")
+        
+        # 转换为torch.Tensor
+        points = torch.from_numpy(points).float()
+        
+        return points
+    
     def __call__(self, results,):
         """Call function to load points data from file.
 
@@ -778,20 +934,42 @@ class Loadnuradarpoints(object):
 
                 - points (:obj:`BasePoints`): Point clouds data.
         """
-        #todo change by the mmcv.load! flient
-        points, radar_tokens, times = self.get_nu_radar(results['sample_idx'], True, self.num_sweeps, filter=self.filter)
-        points = torch.cat([points, times], dim=0)
-        points[2 , :] = 0 #-0.15
+        # 检查是否是自定义数据集（通过pts_filename判断）
+        if 'pts_filename' in results and (results['pts_filename'].endswith('.pcd') or 
+                                          results['pts_filename'].endswith('.npy')):
+            # 自定义数据集：直接加载.pcd或.npy文件
+            points = self._load_own_radar(results['pts_filename'])
+            
+            # 格式化为 (N, 7): [x, y, z, vx, vy, RCS, timestamp]
+            # 保持与nuScenes相同的格式
+            if self.coord_type == 'RADAR':
+                coord_type = 'LIDAR'
+            else:
+                coord_type = self.coord_type
+            
+            points_class = get_points_type(coord_type)
+            points = points_class(
+                points, points_dim=points.shape[-1], attribute_dims=None)
+            
+            results['radar_points'] = [points]
+            results['radar_tokens'] = [[]]  # 空token列表
+        else:
+            # nuScenes数据集：使用原有逻辑
+            points, radar_tokens, times = self.get_nu_radar(results['sample_idx'], True, self.num_sweeps, filter=self.filter)
+            points = torch.cat([points, times], dim=0)
+            points[2 , :] = 0 #-0.15
 
-        points = points[[0,1,2,5,8,9,18], :].transpose(0, 1).contiguous()
+            points = points[[0,1,2,5,8,9,18], :].transpose(0, 1).contiguous()
 
-        if self.coord_type == 'RADAR':
-            coord_type = 'LIDAR'
-        points_class = get_points_type(coord_type)
-        points = points_class(
-            points, points_dim=points.shape[-1], attribute_dims=None,)
-        results['radar_points'] = [points]
-        results['radar_tokens'] = [radar_tokens]
+            if self.coord_type == 'RADAR':
+                coord_type = 'LIDAR'
+            else:
+                coord_type = self.coord_type
+            points_class = get_points_type(coord_type)
+            points = points_class(
+                points, points_dim=points.shape[-1], attribute_dims=None,)
+            results['radar_points'] = [points]
+            results['radar_tokens'] = [radar_tokens]
 
         return results
 
